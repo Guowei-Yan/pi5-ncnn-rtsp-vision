@@ -4,10 +4,11 @@ import json
 import logging
 import os
 import queue
+import signal
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,6 +19,7 @@ from pi5_ncnn_vision.engine import HybridModelRouter
 from pi5_ncnn_vision.ocr import CropOCRProcessor
 from pi5_ncnn_vision.types import (
     DEFAULT_FFMPEG_CAPTURE_OPTIONS,
+    Detection,
     FramePacket,
     InferenceRecord,
     PipelineConfig,
@@ -188,15 +190,14 @@ class RotatingNDJSONSink:
     def flush(self) -> None:
         if not self._buffer or self._fh is None:
             return
+        if self.enable_rotation and self._bytes_written >= self.max_file_size_bytes:
+            self._rotate()
         chunk = "\n".join(self._buffer) + "\n"
         encoded_len = len(chunk.encode("utf-8"))
         self._fh.write(chunk)
         self._fh.flush()
         self._bytes_written += encoded_len
         self._buffer.clear()
-
-        if self.enable_rotation and self._bytes_written >= self.max_file_size_bytes:
-            self._rotate()
 
     def _rotate(self) -> None:
         if self._fh is not None:
@@ -342,6 +343,9 @@ class MultiStreamPipeline:
                 self._recent_latencies_ms.append(latency_ms)
                 self._recent_inference_ms.append(total_ms)
 
+            if self.config.save_images and detections:
+                self._save_annotated_frame(packet, detections)
+
             try:
                 self.result_queue.put_nowait(record)
             except queue.Full:
@@ -349,6 +353,40 @@ class MultiStreamPipeline:
                     self._queue_drops += 1
 
         return records
+
+    def _save_annotated_frame(
+        self,
+        packet: FramePacket,
+        detections: Sequence[Detection],
+    ) -> Path | None:
+        """Render bounding boxes onto a copy of `packet.frame_bgr` and save to `<output_dir>/images/`."""
+        image_dir = Path(self.config.output_dir) / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        canvas = packet.frame_bgr.copy()
+        h, w = canvas.shape[:2]
+        for det in detections:
+            x1 = max(0, min(round(det.bbox[0]), w - 1))
+            y1 = max(0, min(round(det.bbox[1]), h - 1))
+            x2 = max(0, min(round(det.bbox[2]), w - 1))
+            y2 = max(0, min(round(det.bbox[3]), h - 1))
+            if x2 > x1 and y2 > y1:
+                canvas[y1 : min(y1 + 2, h), x1:x2] = (0, 255, 0)
+                canvas[max(0, y2 - 2) : y2, x1:x2] = (0, 255, 0)
+                canvas[y1:y2, x1 : min(x1 + 2, w)] = (0, 255, 0)
+                canvas[y1:y2, max(0, x2 - 2) : x2] = (0, 255, 0)
+
+        out_path = (
+            image_dir
+            / f"stream{packet.stream_id}_frame{packet.frame_count:06d}.npy"
+        )
+        try:
+            import cv2
+            jpg_path = out_path.with_suffix(".jpg")
+            cv2.imwrite(str(jpg_path), canvas)
+            return jpg_path
+        except ImportError:
+            np.save(out_path, canvas)
+            return out_path
 
     def _decoder_loop(self, stream_id: int, url: str) -> None:
         target_interval = 1.0 / self.config.target_fps_per_stream
@@ -379,30 +417,36 @@ class MultiStreamPipeline:
             with self._stats_lock:
                 self._connected[stream_id] = True
 
-            while not self.stop_event.is_set():
-                ok, frame = cap.read()
-                if not ok or frame is None:
+            try:
+                while not self.stop_event.is_set():
+                    try:
+                        ok, frame = cap.read()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Stream %d read error: %s", stream_id, exc)
+                        ok, frame = False, None
+
+                    if not ok or frame is None:
+                        with self._stats_lock:
+                            self._connected[stream_id] = False
+                        break
+
+                    now = time.perf_counter()
                     with self._stats_lock:
-                        self._connected[stream_id] = False
-                    break
+                        self._decode_counts[stream_id] += 1
 
-                now = time.perf_counter()
-                with self._stats_lock:
-                    self._decode_counts[stream_id] += 1
-
-                if (now - last_sample_time) >= target_interval:
-                    sample_counter += 1
-                    last_sample_time = now
-                    self.slots[stream_id].put(
-                        frame_bgr=frame,
-                        capture_timestamp=now,
-                        frame_count=sample_counter,
-                        stream_id=stream_id,
-                    )
-                    with self._stats_lock:
-                        self._sample_counts[stream_id] = sample_counter
-
-            cap.release()
+                    if (now - last_sample_time) >= target_interval:
+                        sample_counter += 1
+                        last_sample_time = now
+                        self.slots[stream_id].put(
+                            frame_bgr=frame,
+                            capture_timestamp=now,
+                            frame_count=sample_counter,
+                            stream_id=stream_id,
+                        )
+                        with self._stats_lock:
+                            self._sample_counts[stream_id] = sample_counter
+            finally:
+                cap.release()
             if not self.stop_event.is_set():
                 self.stop_event.wait(self.config.reconnect_delay_sec)
 
@@ -410,7 +454,7 @@ class MultiStreamPipeline:
         while not self.stop_event.is_set():
             records = self.process_available_slots_once()
             if not records:
-                time.sleep(0.001)
+                self.stop_event.wait(0.001)
 
     def _writer_loop(self, sink: RotatingNDJSONSink) -> None:
         last_flush = time.perf_counter()
@@ -419,16 +463,23 @@ class MultiStreamPipeline:
                 record = self.result_queue.get(timeout=0.1)
                 sink.write(record)
             except queue.Empty:
-                now = time.perf_counter()
-                if (now - last_flush) >= self.config.json_flush_interval_sec:
-                    sink.flush()
-                    last_flush = now
+                pass
+            now = time.perf_counter()
+            if (now - last_flush) >= self.config.json_flush_interval_sec:
+                sink.flush()
+                last_flush = now
 
         sink.flush()
 
     def run(self, max_duration_sec: float | None = None) -> dict[str, Any]:
         """Run the full multi-stream pipeline until interrupted or `max_duration_sec` elapses."""
-        configure_ffmpeg_capture_env(self.config.opencv_ffmpeg_options)
+        configure_ffmpeg_capture_env(self.config.opencv_ffmpeg_options, overwrite=True)
+
+        prev_sigterm: Any = None
+        in_main_thread = threading.current_thread() is threading.main_thread()
+        if in_main_thread:
+            prev_sigterm = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, lambda _sig, _frm: self.stop_event.set())
 
         max_bytes = int(self.config.max_json_file_size_mb * 1024 * 1024)
         with RotatingNDJSONSink(
@@ -463,20 +514,14 @@ class MultiStreamPipeline:
             inference_thread.start()
             writer_thread.start()
 
-            start_time = time.perf_counter()
             try:
-                while not self.stop_event.is_set():
-                    if (
-                        max_duration_sec is not None
-                        and (time.perf_counter() - start_time) >= max_duration_sec
-                    ):
-                        self.stop_event.set()
-                        break
-                    time.sleep(0.05)
+                self.stop_event.wait(timeout=max_duration_sec)
             except KeyboardInterrupt:
                 self.stop_event.set()
             finally:
                 self.stop_event.set()
+                if in_main_thread and prev_sigterm is not None:
+                    signal.signal(signal.SIGTERM, prev_sigterm)
                 for thread in decoder_threads:
                     thread.join(timeout=2.0)
                 inference_thread.join(timeout=2.0)

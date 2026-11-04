@@ -66,6 +66,7 @@ class CropOCRProcessor:
         predictor: OCRPredictor | None = None,
         *,
         reco_arch: str = "crnn_mobilenet_v3_small",
+        pretrained: bool = True,
         target_class_id: int = 1,
         min_det_score: float = 0.3,
         min_ocr_confidence: float = 0.7,
@@ -80,7 +81,7 @@ class CropOCRProcessor:
                     "python-doctr is required when no custom OCR predictor is supplied. "
                     "Install with: pip install 'pi5-ncnn-rtsp-vision[ocr]'"
                 ) from exc
-            predictor = recognition_predictor(reco_arch)
+            predictor = recognition_predictor(reco_arch, pretrained=pretrained)
 
         self._predictor = predictor
         self.target_class_id = target_class_id
@@ -96,8 +97,14 @@ class CropOCRProcessor:
                 str(raw_item.get("value", "")),
                 float(raw_item.get("confidence", 0.0)),
             )
-        if isinstance(raw_item, tuple) and len(raw_item) >= 2:
-            return str(raw_item[0]), float(raw_item[1])
+        if isinstance(raw_item, (tuple, list)) and len(raw_item) >= 2:
+            first, second = raw_item[0], raw_item[1]
+            if isinstance(first, (str, int, float)) and isinstance(second, (int, float)):
+                return str(first), float(second)
+        if isinstance(raw_item, list) and raw_item and isinstance(raw_item[0], dict):
+            texts = [str(tok.get("value", "")) for tok in raw_item]
+            confs = [float(tok.get("confidence", 0.0)) for tok in raw_item]
+            return "".join(texts), (sum(confs) / len(confs) if confs else 0.0)
         return str(raw_item), 0.0
 
     def annotate(

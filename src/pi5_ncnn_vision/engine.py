@@ -187,11 +187,17 @@ class NCNNDetector:
         except AttributeError:
             pass
 
-        ex.input("in0", mat_in)
+        ret_in = ex.input("in0", mat_in)
+        if isinstance(ret_in, int) and ret_in != 0:
+            raise RuntimeError(f"NCNN failed to feed input blob 'in0' (ret={ret_in}).")
         raw_blobs: dict[str, np.ndarray] = {}
         for name in self.OUTPUT_BLOB_NAMES:
             out_mat = self._ncnn.Mat()
-            ex.extract(name, out_mat)
+            ret_out = ex.extract(name, out_mat)
+            if isinstance(ret_out, int) and ret_out != 0:
+                raise RuntimeError(
+                    f"NCNN failed to extract output blob '{name}' (ret={ret_out})."
+                )
             raw_blobs[name] = np.array(out_mat, copy=True)
 
         return self.decoder.pair_multiscale_blobs(raw_blobs)

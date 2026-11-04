@@ -5,6 +5,7 @@ import json
 import random
 import sys
 from collections.abc import Sequence
+from contextlib import ExitStack
 from pathlib import Path
 
 from pi5_ncnn_vision.audit import audit_onnx_graph, inspect_ncnn_precision
@@ -52,6 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--runs", type=int, default=10)
     p_bench.add_argument("--threads", type=int, default=2)
     p_bench.add_argument("--gpu-device", type=int, default=0)
+    p_bench.add_argument("--input-width", type=int, default=320)
+    p_bench.add_argument("--input-height", type=int, default=320)
+    p_bench.add_argument("--num-classes", type=int, default=80)
 
     p_run = sub.add_parser(
         "run-rtsp",
@@ -97,7 +101,11 @@ def _cmd_inspect_ncnn(args: argparse.Namespace) -> int:
 def _cmd_benchmark(args: argparse.Namespace) -> int:
     param_gpu = args.param_gpu or args.param_cpu
     bin_gpu = args.bin_gpu or args.bin_cpu
-    spec = DecoderSpec()
+    spec = DecoderSpec(
+        input_width=args.input_width,
+        input_height=args.input_height,
+        num_classes=args.num_classes,
+    )
 
     with VulkanRuntimeContext(enabled=True) as vk:
         if vk.gpu_count == 0:
@@ -146,7 +154,8 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
 
 def _cmd_run_rtsp(args: argparse.Namespace) -> int:
     cfg = PipelineConfig.from_yaml(args.config)
-    with VulkanRuntimeContext(enabled=cfg.use_hybrid_mode) as vk:
+    with ExitStack() as stack:
+        vk = stack.enter_context(VulkanRuntimeContext(enabled=cfg.use_hybrid_mode))
         use_hybrid = cfg.use_hybrid_mode and vk.gpu_count > 0
         gpu_stream = (
             cfg.gpu_stream_id
@@ -154,46 +163,51 @@ def _cmd_run_rtsp(args: argparse.Namespace) -> int:
             else random.randint(0, len(cfg.rtsp_urls) - 1)
         )
 
-        cpu_det = NCNNDetector(
-            cfg.model_param_cpu,
-            cfg.model_bin_cpu,
-            decoder_spec=cfg.decoder,
-            num_threads=cfg.ncnn_num_threads,
-            use_vulkan=False,
-        )
-        gpu_det = (
+        cpu_det = stack.enter_context(
             NCNNDetector(
-                cfg.model_param_gpu or cfg.model_param_cpu,
-                cfg.model_bin_gpu or cfg.model_bin_cpu,
+                cfg.model_param_cpu,
+                cfg.model_bin_cpu,
                 decoder_spec=cfg.decoder,
                 num_threads=cfg.ncnn_num_threads,
-                use_vulkan=True,
-                gpu_device=cfg.gpu_device_id,
+                use_vulkan=False,
+            )
+        )
+        gpu_det = (
+            stack.enter_context(
+                NCNNDetector(
+                    cfg.model_param_gpu or cfg.model_param_cpu,
+                    cfg.model_bin_gpu or cfg.model_bin_cpu,
+                    decoder_spec=cfg.decoder,
+                    num_threads=cfg.ncnn_num_threads,
+                    use_vulkan=True,
+                    gpu_device=cfg.gpu_device_id,
+                )
             )
             if use_hybrid
             else None
         )
+        router = stack.enter_context(
+            HybridModelRouter(cpu_det, gpu_det, gpu_stream_id=gpu_stream)
+        )
+        if use_hybrid and cfg.gpu_validation_runs > 0:
+            router.benchmark(runs=cfg.gpu_validation_runs)
 
-        with HybridModelRouter(cpu_det, gpu_det, gpu_stream_id=gpu_stream) as router:
-            if use_hybrid and cfg.gpu_validation_runs > 0:
-                router.benchmark(runs=cfg.gpu_validation_runs)
-
-            ocr_proc = (
-                CropOCRProcessor(
-                    reco_arch=cfg.ocr_reco_arch,
-                    target_class_id=cfg.sign_class_id,
-                    min_det_score=cfg.sign_score_threshold,
-                    min_ocr_confidence=cfg.ocr_min_confidence,
-                    max_crops_per_frame=cfg.ocr_max_crops_per_frame,
-                    allowed_speeds=cfg.allowed_speeds,
-                )
-                if cfg.enable_sign_ocr
-                else None
+        ocr_proc = (
+            CropOCRProcessor(
+                reco_arch=cfg.ocr_reco_arch,
+                target_class_id=cfg.sign_class_id,
+                min_det_score=cfg.sign_score_threshold,
+                min_ocr_confidence=cfg.ocr_min_confidence,
+                max_crops_per_frame=cfg.ocr_max_crops_per_frame,
+                allowed_speeds=cfg.allowed_speeds,
             )
+            if cfg.enable_sign_ocr
+            else None
+        )
 
-            pipeline = MultiStreamPipeline(cfg, router, ocr_processor=ocr_proc)
-            summary = pipeline.run(max_duration_sec=args.duration)
-            print(json.dumps(summary, indent=2))
+        pipeline = MultiStreamPipeline(cfg, router, ocr_processor=ocr_proc)
+        summary = pipeline.run(max_duration_sec=args.duration)
+        print(json.dumps(summary, indent=2))
     return 0
 
 

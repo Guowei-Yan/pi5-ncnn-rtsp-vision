@@ -19,6 +19,7 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 def test_inspect_real_picodet_ncnn_param_files() -> None:
     m320 = MODELS_DIR / "picodet_m_320_quant_opt.param"
+    m320_fp = MODELS_DIR / "picodet_m_320_no_postprocess_opt.param"
     s640 = MODELS_DIR / "picodet_s_640_two_class_int8.param"
 
     rep_m = inspect_ncnn_precision(m320)
@@ -26,6 +27,10 @@ def test_inspect_real_picodet_ncnn_param_files() -> None:
     assert rep_m.has_int8_markers is True
     assert rep_m.detected_precision == "INT8"
     assert rep_m.weight_count > 3_000_000
+
+    rep_fp = inspect_ncnn_precision(m320_fp)
+    assert rep_fp.has_int8_markers is False
+    assert rep_fp.detected_precision == "FP32/FP16 (Topology Only)"
 
     rep_s = inspect_ncnn_precision(s640)
     assert rep_s.has_int8_markers is True

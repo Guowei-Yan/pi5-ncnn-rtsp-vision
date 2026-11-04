@@ -210,6 +210,12 @@ class PicoDetDecoder:
                 idx = np.flatnonzero(scores >= self.spec.score_threshold)
                 if idx.size == 0:
                     continue
+                if idx.size > self.spec.nms_top_k:
+                    level_scores = scores[idx]
+                    part = np.argpartition(
+                        level_scores, level_scores.size - self.spec.nms_top_k
+                    )[-self.spec.nms_top_k :]
+                    idx = idx[part]
 
                 boxes = self.decode_dfl_boxes(reg_mat, idx, num_anchors)
                 class_boxes.append(boxes)

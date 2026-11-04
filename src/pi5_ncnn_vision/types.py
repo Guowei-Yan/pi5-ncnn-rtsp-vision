@@ -178,7 +178,6 @@ class PipelineConfig:
     target_fps_per_stream: float = 2.0
     cap_buffersize: int = 1
     result_queue_maxsize: int = 100
-    image_queue_maxsize: int = 50
     ncnn_num_threads: int = 2
     use_hybrid_mode: bool = True
     gpu_device_id: int = 0
@@ -269,7 +268,6 @@ class PipelineConfig:
             target_fps_per_stream=float(data.get("target_fps_per_stream", 2.0)),
             cap_buffersize=int(data.get("cap_buffersize", 1)),
             result_queue_maxsize=int(data.get("result_queue_maxsize", 100)),
-            image_queue_maxsize=int(data.get("image_queue_maxsize", 50)),
             ncnn_num_threads=int(data.get("ncnn_num_threads", 2)),
             use_hybrid_mode=bool(data.get("use_hybrid_mode", True)),
             gpu_device_id=int(data.get("gpu_device_id", 0)),

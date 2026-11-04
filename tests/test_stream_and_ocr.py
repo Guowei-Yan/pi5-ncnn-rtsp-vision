@@ -53,6 +53,7 @@ def test_rotating_ndjson_sink_rotation(tmp_path: Path) -> None:
 
     files = sorted(tmp_path.glob("test_events_*.ndjson"))
     assert len(files) >= 2
+    assert all(f.stat().st_size > 0 for f in files)
     records = []
     for file in files:
         for line in file.read_text(encoding="utf-8").splitlines():
@@ -136,6 +137,7 @@ def test_multi_stream_pipeline_slot_processing(tmp_path: Path) -> None:
             "model_param_cpu": "cpu.param",
             "model_bin_cpu": "cpu.bin",
             "gpu_stream_id": 1,
+            "save_images": True,
             "output_dir": str(tmp_path),
         }
     )
@@ -166,3 +168,5 @@ def test_multi_stream_pipeline_slot_processing(tmp_path: Path) -> None:
     assert stats["num_streams"] == 3
     assert stats["total_inferences"] == 2
     assert stats["total_detections"] == 2
+    saved_images = list((tmp_path / "images").glob("stream*"))
+    assert len(saved_images) == 2
