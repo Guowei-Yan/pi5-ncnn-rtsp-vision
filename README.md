@@ -115,7 +115,7 @@ and writes sampled frames into a dedicated `FrameSlot`. If the inference worker 
    ncnnoptimize picodet_m_320_quant.param picodet_m_320_quant.bin picodet_m_320_quant_opt.param picodet_m_320_quant_opt.bin 0
    ```
 
-   Reference NCNN graph topology files (`models/picodet_m_320_quant_opt.param` for 80-class COCO $320 \times 320$ and `models/picodet_s_640_two_class_int8.param` for 2-class `person` + `speed_limit_sign` $640 \times 640$) are included in [`models/`](models/).
+   Reference NCNN graph topology files (`models/picodet_m_320_quant_opt.param` for INT8 80-class COCO $320 \times 320$, `models/picodet_m_320_no_postprocess_opt.param` for FP16/FP32 Vulkan $320 \times 320$, and `models/picodet_s_640_two_class_int8.param` for INT8 2-class `person` + `speed_limit_sign` $640 \times 640$) are included in [`models/`](models/).
 
 ---
 

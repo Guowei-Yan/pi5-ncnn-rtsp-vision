@@ -210,7 +210,7 @@ class PicoDetDecoder:
                 idx = np.flatnonzero(scores >= self.spec.score_threshold)
                 if idx.size == 0:
                     continue
-                if idx.size > self.spec.nms_top_k:
+                if 0 < self.spec.nms_top_k < idx.size:
                     level_scores = scores[idx]
                     part = np.argpartition(
                         level_scores, level_scores.size - self.spec.nms_top_k
@@ -227,7 +227,7 @@ class PicoDetDecoder:
             boxes_all = np.concatenate(class_boxes, axis=0)
             scores_all = np.concatenate(class_scores, axis=0)
 
-            if scores_all.size > self.spec.nms_top_k:
+            if 0 < self.spec.nms_top_k < scores_all.size:
                 top_idx = np.argpartition(
                     scores_all, scores_all.size - self.spec.nms_top_k
                 )[-self.spec.nms_top_k :]

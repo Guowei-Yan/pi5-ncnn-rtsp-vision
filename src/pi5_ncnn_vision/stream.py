@@ -319,7 +319,7 @@ class MultiStreamPipeline:
 
             t_end = time.perf_counter()
             total_ms = (t_end - t_start) * 1000.0
-            latency_ms = max(0.0, (t_start - packet.capture_timestamp) * 1000.0)
+            latency_ms = max(0.0, (t_end - packet.capture_timestamp) * 1000.0)
 
             record = InferenceRecord(
                 stream_id=packet.stream_id,
@@ -456,9 +456,14 @@ class MultiStreamPipeline:
             if not records:
                 self.stop_event.wait(0.001)
 
-    def _writer_loop(self, sink: RotatingNDJSONSink) -> None:
+    def _writer_loop(
+        self,
+        sink: RotatingNDJSONSink,
+        writer_stop_event: threading.Event | None = None,
+    ) -> None:
+        stop_ev = writer_stop_event if writer_stop_event is not None else self.stop_event
         last_flush = time.perf_counter()
-        while not (self.stop_event.is_set() and self.result_queue.empty()):
+        while not (stop_ev.is_set() and self.result_queue.empty()):
             try:
                 record = self.result_queue.get(timeout=0.1)
                 sink.write(record)
@@ -473,6 +478,8 @@ class MultiStreamPipeline:
 
     def run(self, max_duration_sec: float | None = None) -> dict[str, Any]:
         """Run the full multi-stream pipeline until interrupted or `max_duration_sec` elapses."""
+        self.stop_event.clear()
+        writer_stop_event = threading.Event()
         configure_ffmpeg_capture_env(self.config.opencv_ffmpeg_options, overwrite=True)
 
         prev_sigterm: Any = None
@@ -504,7 +511,7 @@ class MultiStreamPipeline:
             )
             writer_thread = threading.Thread(
                 target=self._writer_loop,
-                args=(sink,),
+                args=(sink, writer_stop_event),
                 daemon=True,
                 name="NDJSONWriter",
             )
@@ -525,6 +532,7 @@ class MultiStreamPipeline:
                 for thread in decoder_threads:
                     thread.join(timeout=2.0)
                 inference_thread.join(timeout=2.0)
+                writer_stop_event.set()
                 writer_thread.join(timeout=5.0)
 
         return self.snapshot_stats()

@@ -191,7 +191,6 @@ class PipelineConfig:
     max_json_file_size_mb: float = 100.0
     json_batch_size: int = 10
     json_flush_interval_sec: float = 1.0
-    stats_interval_sec: float = 2.0
     enable_sign_ocr: bool = False
     sign_class_id: int = 1
     sign_score_threshold: float = 0.3
@@ -287,7 +286,6 @@ class PipelineConfig:
             max_json_file_size_mb=float(data.get("max_json_file_size_mb", 100.0)),
             json_batch_size=int(data.get("json_batch_size", 10)),
             json_flush_interval_sec=float(data.get("json_flush_interval_sec", 1.0)),
-            stats_interval_sec=float(data.get("stats_interval_sec", 2.0)),
             enable_sign_ocr=bool(data.get("enable_sign_ocr", False)),
             sign_class_id=int(data.get("sign_class_id", 1)),
             sign_score_threshold=float(data.get("sign_score_threshold", 0.3)),
