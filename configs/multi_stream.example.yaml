@@ -1,0 +1,55 @@
+# Example Multi-Stream RTSP NCNN Configuration for Raspberry Pi CM5 / Pi 5
+# Uses RFC 5737 documentation IP addresses; replace with your camera RTSP endpoints.
+
+rtsp_urls:
+  - "rtsp://192.0.2.11:554/stream1"
+  - "rtsp://192.0.2.12:554/stream1"
+  - "rtsp://192.0.2.13:554/stream1"
+  - "rtsp://192.0.2.14:554/stream1"
+
+# Asymmetric NCNN weights:
+# - CPU (Cortex-A76): INT8 quantized graph
+# - GPU (VideoCore VII Vulkan): FP16 graph (or shared graph run with FP16 Vulkan shaders)
+model_param_cpu: "models/picodet_m_320_quant_opt.param"
+model_bin_cpu: "models/picodet_m_320_quant_opt.bin"
+model_param_gpu: "models/picodet_m_320_no_postprocess_opt.param"
+model_bin_gpu: "models/picodet_m_320_no_postprocess_opt.bin"
+
+# Stripped-postprocess PicoHeadV2 / DFL decoder parameters
+input_width: 320
+input_height: 320
+fpn_strides: [8, 16, 32, 64]
+num_classes: 80
+reg_max: 7
+score_threshold: 0.5
+nms_iou_threshold: 0.5
+nms_top_k: 1000
+keep_top_k: 100
+target_class_ids: [0]
+class_names: ["person"]
+
+# Zero-buffer RTSP & hybrid scheduling
+target_fps_per_stream: 2.0
+cap_buffersize: 1
+opencv_ffmpeg_options: "rtsp_transport;tcp|fflags;nobuffer|probesize;32|analyzeduration;0|stimeout;5000000"
+ncnn_num_threads: 2
+use_hybrid_mode: true
+gpu_device_id: 0
+gpu_stream_id: 0
+gpu_validation_runs: 5
+
+# Telemetry & NDJSON rotation
+output_dir: "output"
+enable_log_rotation: true
+max_json_file_size_mb: 100.0
+json_batch_size: 10
+json_flush_interval_sec: 1.0
+
+# Optional two-stage crop OCR (for 2-class person + speed_limit_sign model)
+enable_sign_ocr: false
+sign_class_id: 1
+sign_score_threshold: 0.3
+ocr_min_confidence: 0.7
+ocr_max_crops_per_frame: 4
+ocr_reco_arch: "crnn_mobilenet_v3_small"
+allowed_speeds: [20, 30, 40, 50, 60, 70, 80, 90, 100, 110]

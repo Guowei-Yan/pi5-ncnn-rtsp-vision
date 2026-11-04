@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pi5-ncnn-rtsp-vision"
+version = "1.0.0"
+description = "Zero-buffer multi-stream RTSP object detection and two-stage OCR on Raspberry Pi CM5 / Pi 5 using NCNN (Cortex-A76 INT8 + VideoCore VII Vulkan FP16) and vectorized NumPy DFL decoding."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Guowei Yan", email = "johnguoweyan@gmail.com" }
+]
+keywords = [
+    "raspberry-pi-5",
+    "cm5",
+    "ncnn",
+    "vulkan",
+    "videocore-vii",
+    "picodet",
+    "rtsp",
+    "edge-ai",
+    "int8",
+    "dfl"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+runtime = [
+    "ncnn>=1.0.20240410",
+    "opencv-python-headless>=4.8.0",
+    "orjson>=3.9.0",
+    "psutil>=5.9.0",
+]
+ocr = [
+    "python-doctr>=0.8.0",
+]
+onnx = [
+    "onnx>=1.15.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[project.scripts]
+pi5-vision = "pi5_ncnn_vision.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Guowei-Yan/pi5-ncnn-rtsp-vision"
+Repository = "https://github.com/Guowei-Yan/pi5-ncnn-rtsp-vision"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+ignore = ["PYI034"]
