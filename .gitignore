@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+uv.lock
+build/
+dist/
+output/
+*.bin
+*.onnx
+*.pdparams
+*.pdmodel
