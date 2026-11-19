@@ -4,7 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 
-Zero-buffer multi-stream RTSP object detection and detection-gated sign-crop CRNN OCR for **Raspberry Pi Compute Module 5 (CM5) / Raspberry Pi 5** (Broadcom BCM2712), built on **NCNN** with asymmetric **Cortex-A76 CPU `INT8` + VideoCore VII Vulkan GPU `FP16`** execution and vectorized NumPy **Distribution Focal Loss (DFL)** decoding.
+Multi-stream RTSP object detection and detection-gated sign-crop CRNN OCR for **Raspberry Pi Compute Module 5 (CM5) / Raspberry Pi 5** (Broadcom BCM2712). Built around **NCNN** with concurrent **Cortex-A76 CPU `INT8`** and **VideoCore VII Vulkan GPU `FP16`** workers, vectorized NumPy **Distribution Focal Loss (DFL)** decoding, and a non-blocking postprocess/logging pipeline.
+
+*(Reference Apache-2.0 COCO `.param` topologies are included in [`models/`](models/); export `.bin` weights via the recipe below to run on Pi 5 hardware. Automated CI validates decoder math, option flags, concurrency, and pipeline lifecycle with mocked NCNN/RTSP harnesses.)*
 
 ---
 
@@ -23,21 +25,21 @@ Deploying multi-camera RTSP vision on an embedded ARM board without a dedicated 
 
 ```
 RTSP Cam 0..N ──► [FFmpeg nobuffer + CAP_PROP_BUFFERSIZE=1]
+                         │ (1 capture thread per stream)
+                         ▼
+                 [FrameSlot 0..N]  (Lock-protected 1-slot overwrite mailbox; event wakeup)
                          │
                          ▼
-                 [FrameSlot 0..N]  (Lock-protected 1-slot overwrite mailbox; drop-oldest)
-                         │
-                         ▼
-               [HybridModelRouter]
-                 ├─► Stream K     ──► VideoCore VII Vulkan GPU (FP16 storage/arithmetic + shader_pack8)
-                 └─► Other Streams ──► Cortex-A76 CPU (INT8 storage/arithmetic + packed layout)
+               [HybridModelRouter] (Independent concurrent backend workers)
+                 ├─► NCNNWorker-GPU ──► VideoCore VII Vulkan GPU (FP16 + shader_pack8)
+                 └─► NCNNWorker-CPU ──► Cortex-A76 CPU (INT8 + NEON packed layout)
                          │
                          ▼
                 [PicoDetDecoder]   (4-stride DFL softmax integral projection + argpartition + hard NMS)
                          │
-                         ├─► Optional [CropOCRProcessor] (In-memory sign crop ──► docTR CRNN recognition)
+                         ├─► Async [PostprocessWorker] (CropOCRProcessor CRNN + optional JPEG dump)
                          ▼
-              [RotatingNDJSONSink] (Batch-buffered, size-rotated .ndjson telemetry)
+              [RotatingNDJSONSink] (Batch-buffered, size-rotated .ndjson telemetry; Unix epoch ts)
 ```
 
 ### 1. Stripped-Postprocess `PicoHeadV2` & Host-Side DFL Decoding (`pi5_ncnn_vision.decoder`)
@@ -74,10 +76,10 @@ Filtering by `score_threshold` *before* running the softmax integral projection 
 Each RTSP reader thread opens its stream with:
 
 ```text
-rtsp_transport;tcp|fflags;nobuffer|probesize;32|analyzeduration;0|stimeout;5000000
+rtsp_transport;tcp|fflags;nobuffer|probesize;32|analyzeduration;0|timeout;5000000
 ```
 
-and writes sampled frames into a dedicated `FrameSlot`. If the inference worker is busy when a newer frame arrives, `FrameSlot.put()` overwrites the unconsumed frame in place and increments `overwrite_drops`, guaranteeing bounded end-to-end latency.
+and writes sampled frames into a dedicated `FrameSlot` wired to its backend worker's `threading.Event`. If the CPU or Vulkan worker is busy when a newer frame arrives, `FrameSlot.put()` overwrites the unconsumed frame in place and increments `overwrite_drops`, bounding end-to-end latency while eliminating busy-wait polling. Optional sign-crop OCR and annotated frame saves are handed off to a bounded `PostprocessWorker` queue so downstream I/O never stalls either NCNN detector thread.
 
 ---
 
@@ -147,6 +149,8 @@ pi5-vision inspect-ncnn --param models/picodet_m_320_quant_opt.param
 pi5-vision benchmark \
   --param-cpu models/picodet_m_320_quant_opt.param \
   --bin-cpu models/picodet_m_320_quant_opt.bin \
+  --param-gpu models/picodet_m_320_no_postprocess_opt.param \
+  --bin-gpu models/picodet_m_320_no_postprocess_opt.bin \
   --runs 20 --threads 2
 ```
 

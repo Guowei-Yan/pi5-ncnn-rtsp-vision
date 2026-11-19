@@ -140,8 +140,16 @@ class NCNNDetector:
             opt.use_int8_storage = True
             opt.use_int8_arithmetic = True
             opt.use_int8_packed = True
+            opt.use_fp16_storage = False
+            opt.use_fp16_packed = False
+            opt.use_fp16_arithmetic = False
+            opt.use_shader_pack8 = False
+            opt.use_image_storage = False
+            opt.use_vulkan_compute = False
         else:
             opt.use_int8_storage = True
+            opt.use_int8_arithmetic = False
+            opt.use_int8_packed = False
             opt.use_fp16_packed = True
             opt.use_fp16_storage = True
             opt.use_fp16_arithmetic = True
@@ -162,10 +170,17 @@ class NCNNDetector:
         if orig_h <= 0 or orig_w <= 0:
             raise ValueError("Input frame has zero width or height.")
 
-        rgb = np.ascontiguousarray(frame_bgr[..., ::-1])
+        pixel_type_enum = self._ncnn.Mat.PixelType
+        bgr2rgb = getattr(pixel_type_enum, "PIXEL_BGR2RGB", None)
+        if bgr2rgb is not None:
+            buf = np.ascontiguousarray(frame_bgr)
+            pixel_type = bgr2rgb
+        else:
+            buf = np.ascontiguousarray(frame_bgr[..., ::-1])
+            pixel_type = pixel_type_enum.PIXEL_RGB
         mat = self._ncnn.Mat.from_pixels_resize(
-            rgb,
-            self._ncnn.Mat.PixelType.PIXEL_RGB,
+            buf,
+            pixel_type,
             orig_w,
             orig_h,
             self.decoder.spec.input_width,

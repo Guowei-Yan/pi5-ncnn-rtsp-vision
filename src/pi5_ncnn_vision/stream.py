@@ -83,12 +83,22 @@ class FrameSlot:
     overwritten in place so inference latency never accumulates behind camera buffers.
     """
 
-    def __init__(self, stream_id: int = 0) -> None:
+    def __init__(
+        self,
+        stream_id: int = 0,
+        *,
+        notify_event: threading.Event | None = None,
+    ) -> None:
         self.stream_id = stream_id
         self._lock = threading.Lock()
         self._packet: FramePacket | None = None
         self._consumed: bool = True
         self._overwrite_drops: int = 0
+        self._notify_event = notify_event
+
+    def set_notify_event(self, event: threading.Event | None) -> None:
+        with self._lock:
+            self._notify_event = event
 
     def put(
         self,
@@ -96,6 +106,8 @@ class FrameSlot:
         capture_timestamp: float,
         frame_count: int,
         stream_id: int | None = None,
+        *,
+        capture_monotonic: float | None = None,
     ) -> None:
         resolved_id = self.stream_id if stream_id is None else stream_id
         packet = FramePacket(
@@ -103,12 +115,16 @@ class FrameSlot:
             frame_count=frame_count,
             capture_timestamp=capture_timestamp,
             frame_bgr=frame_bgr,
+            capture_monotonic=capture_monotonic,
         )
         with self._lock:
             if not self._consumed and self._packet is not None:
                 self._overwrite_drops += 1
             self._packet = packet
             self._consumed = False
+            notify = self._notify_event
+        if notify is not None:
+            notify.set()
 
     def take_if_new(self) -> FramePacket | None:
         with self._lock:
@@ -247,7 +263,23 @@ class MultiStreamPipeline:
         self.result_queue: queue.Queue[InferenceRecord] = queue.Queue(
             maxsize=config.result_queue_maxsize
         )
+        self._postprocess_queue: queue.Queue[tuple[Any, ...]] = queue.Queue(
+            maxsize=config.result_queue_maxsize
+        )
         self.stop_event = threading.Event()
+        self._cpu_wake_event = threading.Event()
+        self._gpu_wake_event = threading.Event()
+
+        self._cpu_slot_ids: tuple[int, ...] = tuple(
+            i for i in range(self.num_streams) if self.router.backend_for_stream(i) != "GPU"
+        )
+        self._gpu_slot_ids: tuple[int, ...] = tuple(
+            i for i in range(self.num_streams) if self.router.backend_for_stream(i) == "GPU"
+        )
+        for i in self._cpu_slot_ids:
+            self.slots[i].set_notify_event(self._cpu_wake_event)
+        for i in self._gpu_slot_ids:
+            self.slots[i].set_notify_event(self._gpu_wake_event)
 
         self._stats_lock = threading.Lock()
         self._decode_counts = [0] * self.num_streams
@@ -257,6 +289,7 @@ class MultiStreamPipeline:
         self._reconnect_counts = [0] * self.num_streams
         self._connected = [False] * self.num_streams
         self._queue_drops = 0
+        self._postprocess_drops = 0
         self._recent_latencies_ms: deque[float] = deque(maxlen=100)
         self._recent_inference_ms: deque[float] = deque(maxlen=100)
 
@@ -267,6 +300,7 @@ class MultiStreamPipeline:
                 "total_inferences": sum(self._inference_counts),
                 "total_detections": sum(self._detection_counts),
                 "queue_drops": self._queue_drops,
+                "postprocess_drops": self._postprocess_drops,
                 "overwrite_drops": [slot.overwrite_drops for slot in self.slots],
                 "avg_latency_ms": (
                     float(np.mean(self._recent_latencies_ms))
@@ -294,64 +328,140 @@ class MultiStreamPipeline:
                 ],
             }
 
+    def _finalize_record(
+        self,
+        packet: FramePacket,
+        detections: list[Detection],
+        pre_ms: float,
+        fwd_ms: float,
+        post_ms: float,
+        det_elapsed_ms: float,
+        backend: str,
+        *,
+        run_ocr: bool = True,
+        save_image: bool = True,
+    ) -> InferenceRecord:
+        ocr_ms = 0.0
+        if run_ocr and self.ocr_processor is not None and detections:
+            t_ocr = time.perf_counter()
+            try:
+                detections = self.ocr_processor.annotate(packet.frame_bgr, detections)
+            except Exception:
+                logger.exception("OCR postprocessing failed for stream %d", packet.stream_id)
+            ocr_ms = (time.perf_counter() - t_ocr) * 1000.0
+
+        t_end_mono = time.perf_counter()
+        t_end_wall = time.time()
+        # Exclude async queue dwell time so inference_time_ms reflects compute latency only.
+        total_ms = det_elapsed_ms + ocr_ms
+        if packet.capture_monotonic is not None:
+            latency_ms = max(0.0, (t_end_mono - packet.capture_monotonic) * 1000.0)
+        elif packet.capture_timestamp > 1_000_000_000.0:
+            latency_ms = max(0.0, (t_end_wall - packet.capture_timestamp) * 1000.0)
+        else:
+            latency_ms = total_ms
+
+        record = InferenceRecord(
+            stream_id=packet.stream_id,
+            frame_count=packet.frame_count,
+            capture_timestamp=packet.capture_timestamp,
+            inference_timestamp=t_end_wall,
+            latency_ms=latency_ms,
+            preprocess_ms=pre_ms,
+            forward_ms=fwd_ms,
+            postprocess_ms=post_ms,
+            ocr_ms=ocr_ms,
+            inference_time_ms=total_ms,
+            backend=backend,
+            detections=tuple(detections),
+        )
+
+        with self._stats_lock:
+            self._inference_counts[packet.stream_id] += 1
+            self._detection_counts[packet.stream_id] += len(detections)
+            self._recent_latencies_ms.append(latency_ms)
+            self._recent_inference_ms.append(total_ms)
+
+        if save_image and self.config.save_images and detections:
+            try:
+                self._save_annotated_frame(packet, detections)
+            except Exception:
+                logger.exception("Annotated frame save failed for stream %d", packet.stream_id)
+
+        try:
+            self.result_queue.put_nowait(record)
+        except queue.Full:
+            with self._stats_lock:
+                self._queue_drops += 1
+
+        return record
+
+    def _process_slot(
+        self,
+        slot: FrameSlot,
+        *,
+        async_postprocess: bool = False,
+    ) -> tuple[bool, InferenceRecord | None]:
+        packet = slot.take_if_new()
+        if packet is None:
+            return False, None
+
+        t_start_mono = time.perf_counter()
+        detector = self.router.select_detector(packet.stream_id)
+        backend = self.router.backend_for_stream(packet.stream_id)
+        detections, pre_ms, fwd_ms, post_ms = detector.detect_timed(
+            packet.frame_bgr
+        )
+        det_elapsed_ms = (time.perf_counter() - t_start_mono) * 1000.0
+
+        needs_postprocess = bool(
+            detections and (self.ocr_processor is not None or self.config.save_images)
+        )
+        if async_postprocess and needs_postprocess:
+            try:
+                self._postprocess_queue.put_nowait(
+                    (packet, detections, pre_ms, fwd_ms, post_ms, det_elapsed_ms, backend)
+                )
+                return True, None
+            except queue.Full:
+                with self._stats_lock:
+                    self._postprocess_drops += 1
+                rec = self._finalize_record(
+                    packet,
+                    detections,
+                    pre_ms,
+                    fwd_ms,
+                    post_ms,
+                    det_elapsed_ms,
+                    backend,
+                    run_ocr=False,
+                    save_image=False,
+                )
+                return True, rec
+
+        rec = self._finalize_record(
+            packet,
+            detections,
+            pre_ms,
+            fwd_ms,
+            post_ms,
+            det_elapsed_ms,
+            backend,
+            run_ocr=True,
+            save_image=True,
+        )
+        return True, rec
+
     def process_available_slots_once(self) -> list[InferenceRecord]:
         """
-        Poll each stream's `FrameSlot` once and run inference on all unconsumed frames.
-        Useful both for deterministic unit tests and inside the continuous worker loop.
+        Poll each stream's `FrameSlot` once and run inference + postprocessing synchronously.
+        Useful for deterministic unit tests and single-step evaluation.
         """
         records: list[InferenceRecord] = []
         for slot in self.slots:
-            packet = slot.take_if_new()
-            if packet is None:
-                continue
-
-            t_start = time.perf_counter()
-            detector = self.router.select_detector(packet.stream_id)
-            detections, pre_ms, fwd_ms, post_ms = detector.detect_timed(
-                packet.frame_bgr
-            )
-
-            ocr_ms = 0.0
-            if self.ocr_processor is not None and detections:
-                t_ocr = time.perf_counter()
-                detections = self.ocr_processor.annotate(packet.frame_bgr, detections)
-                ocr_ms = (time.perf_counter() - t_ocr) * 1000.0
-
-            t_end = time.perf_counter()
-            total_ms = (t_end - t_start) * 1000.0
-            latency_ms = max(0.0, (t_end - packet.capture_timestamp) * 1000.0)
-
-            record = InferenceRecord(
-                stream_id=packet.stream_id,
-                frame_count=packet.frame_count,
-                capture_timestamp=packet.capture_timestamp,
-                inference_timestamp=t_end,
-                latency_ms=latency_ms,
-                preprocess_ms=pre_ms,
-                forward_ms=fwd_ms,
-                postprocess_ms=post_ms,
-                ocr_ms=ocr_ms,
-                inference_time_ms=total_ms,
-                backend=self.router.backend_for_stream(packet.stream_id),
-                detections=tuple(detections),
-            )
-            records.append(record)
-
-            with self._stats_lock:
-                self._inference_counts[packet.stream_id] += 1
-                self._detection_counts[packet.stream_id] += len(detections)
-                self._recent_latencies_ms.append(latency_ms)
-                self._recent_inference_ms.append(total_ms)
-
-            if self.config.save_images and detections:
-                self._save_annotated_frame(packet, detections)
-
-            try:
-                self.result_queue.put_nowait(record)
-            except queue.Full:
-                with self._stats_lock:
-                    self._queue_drops += 1
-
+            _, rec = self._process_slot(slot, async_postprocess=False)
+            if rec is not None:
+                records.append(rec)
         return records
 
     def _save_annotated_frame(
@@ -428,20 +538,22 @@ class MultiStreamPipeline:
                     if not ok or frame is None:
                         with self._stats_lock:
                             self._connected[stream_id] = False
+                            self._reconnect_counts[stream_id] += 1
                         break
 
-                    now = time.perf_counter()
+                    now_mono = time.perf_counter()
                     with self._stats_lock:
                         self._decode_counts[stream_id] += 1
 
-                    if (now - last_sample_time) >= target_interval:
+                    if (now_mono - last_sample_time) >= target_interval:
                         sample_counter += 1
-                        last_sample_time = now
+                        last_sample_time = now_mono
                         self.slots[stream_id].put(
                             frame_bgr=frame,
-                            capture_timestamp=now,
+                            capture_timestamp=time.time(),
                             frame_count=sample_counter,
                             stream_id=stream_id,
+                            capture_monotonic=now_mono,
                         )
                         with self._stats_lock:
                             self._sample_counts[stream_id] = sample_counter
@@ -450,11 +562,60 @@ class MultiStreamPipeline:
             if not self.stop_event.is_set():
                 self.stop_event.wait(self.config.reconnect_delay_sec)
 
-    def _inference_loop(self) -> None:
+    def _backend_inference_loop(
+        self,
+        slot_ids: Sequence[int],
+        wake_event: threading.Event,
+        *,
+        async_postprocess: bool,
+    ) -> None:
         while not self.stop_event.is_set():
-            records = self.process_available_slots_once()
-            if not records:
-                self.stop_event.wait(0.001)
+            wake_event.clear()
+            processed_any = False
+            for stream_id in slot_ids:
+                if self.stop_event.is_set():
+                    break
+                try:
+                    taken, _ = self._process_slot(
+                        self.slots[stream_id],
+                        async_postprocess=async_postprocess,
+                    )
+                except Exception:
+                    logger.exception("Inference worker error on stream %d", stream_id)
+                    continue
+                if taken:
+                    processed_any = True
+            if not processed_any and not self.stop_event.is_set():
+                wake_event.wait(timeout=0.05)
+
+    def _postprocess_loop(self, postprocess_stop_event: threading.Event) -> None:
+        while not (postprocess_stop_event.is_set() and self._postprocess_queue.empty()):
+            try:
+                (
+                    packet,
+                    detections,
+                    pre_ms,
+                    fwd_ms,
+                    post_ms,
+                    det_elapsed_ms,
+                    backend,
+                ) = self._postprocess_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            try:
+                self._finalize_record(
+                    packet,
+                    detections,
+                    pre_ms,
+                    fwd_ms,
+                    post_ms,
+                    det_elapsed_ms,
+                    backend,
+                    run_ocr=True,
+                    save_image=True,
+                )
+            except Exception:
+                logger.exception("Postprocess worker error on stream %d", packet.stream_id)
 
     def _writer_loop(
         self,
@@ -479,6 +640,9 @@ class MultiStreamPipeline:
     def run(self, max_duration_sec: float | None = None) -> dict[str, Any]:
         """Run the full multi-stream pipeline until interrupted or `max_duration_sec` elapses."""
         self.stop_event.clear()
+        self._cpu_wake_event.clear()
+        self._gpu_wake_event.clear()
+        postprocess_stop_event = threading.Event()
         writer_stop_event = threading.Event()
         configure_ffmpeg_capture_env(self.config.opencv_ffmpeg_options, overwrite=True)
 
@@ -487,6 +651,10 @@ class MultiStreamPipeline:
         if in_main_thread:
             prev_sigterm = signal.getsignal(signal.SIGTERM)
             signal.signal(signal.SIGTERM, lambda _sig, _frm: self.stop_event.set())
+
+        use_async_postprocess = (
+            self.ocr_processor is not None or self.config.save_images
+        )
 
         max_bytes = int(self.config.max_json_file_size_mb * 1024 * 1024)
         with RotatingNDJSONSink(
@@ -504,10 +672,36 @@ class MultiStreamPipeline:
                 )
                 for i, url in enumerate(self.config.rtsp_urls)
             ]
-            inference_thread = threading.Thread(
-                target=self._inference_loop,
-                daemon=True,
-                name="NCNNInferenceWorker",
+            inference_threads: list[threading.Thread] = []
+            if self._cpu_slot_ids:
+                inference_threads.append(
+                    threading.Thread(
+                        target=self._backend_inference_loop,
+                        args=(self._cpu_slot_ids, self._cpu_wake_event),
+                        kwargs={"async_postprocess": use_async_postprocess},
+                        daemon=True,
+                        name="NCNNWorker-CPU",
+                    )
+                )
+            if self._gpu_slot_ids:
+                inference_threads.append(
+                    threading.Thread(
+                        target=self._backend_inference_loop,
+                        args=(self._gpu_slot_ids, self._gpu_wake_event),
+                        kwargs={"async_postprocess": use_async_postprocess},
+                        daemon=True,
+                        name="NCNNWorker-GPU",
+                    )
+                )
+            postprocess_thread = (
+                threading.Thread(
+                    target=self._postprocess_loop,
+                    args=(postprocess_stop_event,),
+                    daemon=True,
+                    name="PostprocessWorker",
+                )
+                if use_async_postprocess
+                else None
             )
             writer_thread = threading.Thread(
                 target=self._writer_loop,
@@ -518,7 +712,10 @@ class MultiStreamPipeline:
 
             for thread in decoder_threads:
                 thread.start()
-            inference_thread.start()
+            for thread in inference_threads:
+                thread.start()
+            if postprocess_thread is not None:
+                postprocess_thread.start()
             writer_thread.start()
 
             try:
@@ -527,12 +724,20 @@ class MultiStreamPipeline:
                 self.stop_event.set()
             finally:
                 self.stop_event.set()
+                self._cpu_wake_event.set()
+                self._gpu_wake_event.set()
                 if in_main_thread and prev_sigterm is not None:
                     signal.signal(signal.SIGTERM, prev_sigterm)
+                decoder_deadline = time.perf_counter() + 6.0
                 for thread in decoder_threads:
-                    thread.join(timeout=2.0)
-                inference_thread.join(timeout=2.0)
+                    thread.join(timeout=max(0.0, decoder_deadline - time.perf_counter()))
+                infer_deadline = time.perf_counter() + 5.0
+                for thread in inference_threads:
+                    thread.join(timeout=max(0.0, infer_deadline - time.perf_counter()))
+                if postprocess_thread is not None:
+                    postprocess_stop_event.set()
+                    postprocess_thread.join(timeout=5.0)
                 writer_stop_event.set()
-                writer_thread.join(timeout=5.0)
+                writer_thread.join(timeout=10.0)
 
         return self.snapshot_stats()

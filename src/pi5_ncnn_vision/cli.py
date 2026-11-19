@@ -98,7 +98,40 @@ def _cmd_inspect_ncnn(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_if_gpu_falls_back_to_int8(
+    param_gpu: Path,
+    *,
+    explicit_gpu: bool,
+    flag_label: str = "--param-gpu/--bin-gpu",
+) -> None:
+    if not param_gpu.exists():
+        return
+    try:
+        rep = inspect_ncnn_precision(param_gpu)
+    except OSError:
+        return
+    if not rep.has_int8_markers:
+        return
+    if not explicit_gpu:
+        print(
+            f"Warning: {flag_label} was omitted, so Vulkan GPU is falling back to the INT8 CPU graph "
+            f"({param_gpu}). Pass a non-INT8 FP16/FP32 graph via {flag_label} for accurate "
+            "VideoCore VII Vulkan FP16 execution.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Warning: {flag_label} points to an INT8-quantized graph ({param_gpu}, "
+            f"precision={rep.detected_precision}). VideoCore VII Vulkan runs best on a non-INT8 "
+            "FP16/FP32 graph rather than an INT8 CPU graph.",
+            file=sys.stderr,
+        )
+
+
 def _cmd_benchmark(args: argparse.Namespace) -> int:
+    explicit_gpu = args.param_gpu is not None or args.bin_gpu is not None
+    if (args.param_gpu is None) != (args.bin_gpu is None):
+        raise SystemExit("Error: --param-gpu and --bin-gpu must either both be provided or both omitted.")
     param_gpu = args.param_gpu or args.param_cpu
     bin_gpu = args.bin_gpu or args.bin_cpu
     spec = DecoderSpec(
@@ -119,6 +152,8 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
             ) as cpu_det:
                 print(f"Loaded {cpu_det.backend_name} successfully.")
             return 0
+
+        _warn_if_gpu_falls_back_to_int8(param_gpu, explicit_gpu=explicit_gpu)
 
         with (
             NCNNDetector(
@@ -172,11 +207,19 @@ def _cmd_run_rtsp(args: argparse.Namespace) -> int:
                 use_vulkan=False,
             )
         )
+        gpu_param = Path(cfg.model_param_gpu or cfg.model_param_cpu)
+        gpu_bin = Path(cfg.model_bin_gpu or cfg.model_bin_cpu)
+        if use_hybrid:
+            _warn_if_gpu_falls_back_to_int8(
+                gpu_param,
+                explicit_gpu=(cfg.model_param_gpu is not None),
+                flag_label="model_param_gpu/model_bin_gpu",
+            )
         gpu_det = (
             stack.enter_context(
                 NCNNDetector(
-                    cfg.model_param_gpu or cfg.model_param_cpu,
-                    cfg.model_bin_gpu or cfg.model_bin_cpu,
+                    gpu_param,
+                    gpu_bin,
                     decoder_spec=cfg.decoder,
                     num_threads=cfg.ncnn_num_threads,
                     use_vulkan=True,

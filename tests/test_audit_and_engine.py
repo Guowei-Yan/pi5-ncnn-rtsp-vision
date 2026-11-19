@@ -105,17 +105,21 @@ def test_ncnn_detector_asymmetric_options_and_lifecycle(tmp_path: Path) -> None:
     created_nets: list[FakeNet] = []
     vulkan_events: list[str] = []
 
+    pixel_types_seen: list[int] = []
+
     class FakeMat:
         class PixelType:
             PIXEL_RGB = 1
+            PIXEL_BGR2RGB = 2
 
         def __init__(self, arr: np.ndarray | None = None) -> None:
             self._arr = arr if arr is not None else np.zeros((1, 1), dtype=np.float32)
 
         @classmethod
         def from_pixels_resize(
-            cls, rgb: np.ndarray, pixel_type: int, w0: int, h0: int, w1: int, h1: int
+            cls, buf: np.ndarray, pixel_type: int, w0: int, h0: int, w1: int, h1: int
         ) -> FakeMat:
+            pixel_types_seen.append(pixel_type)
             return cls(np.zeros((h1, w1, 3), dtype=np.float32))
 
         def substract_mean_normalize(
@@ -207,16 +211,36 @@ def test_ncnn_detector_asymmetric_options_and_lifecycle(tmp_path: Path) -> None:
             ) as gpu_det,
             HybridModelRouter(cpu_det, gpu_det, gpu_stream_id=0) as router,
         ):
-            # Verify Cortex-A76 CPU INT8 vs VideoCore VII Vulkan FP16 option flags
-            assert created_nets[0].opt.use_int8_arithmetic is True
-            assert created_nets[1].opt.use_fp16_arithmetic is True
-            assert created_nets[1].opt.use_shader_pack8 is True
-            assert created_nets[1].opt.use_vulkan_compute is True
+            # Verify Cortex-A76 CPU INT8 vs VideoCore VII Vulkan FP16 option flags (both True and False)
+            cpu_opt = created_nets[0].opt
+            gpu_opt = created_nets[1].opt
+            assert cpu_opt.use_int8_storage is True
+            assert cpu_opt.use_int8_arithmetic is True
+            assert cpu_opt.use_int8_packed is True
+            assert cpu_opt.use_fp16_storage is False
+            assert cpu_opt.use_fp16_packed is False
+            assert cpu_opt.use_fp16_arithmetic is False
+            assert cpu_opt.use_shader_pack8 is False
+            assert cpu_opt.use_image_storage is False
+            assert cpu_opt.use_vulkan_compute is False
+
+            assert gpu_opt.use_int8_storage is True
+            assert gpu_opt.use_int8_arithmetic is False
+            assert gpu_opt.use_int8_packed is False
+            assert gpu_opt.use_fp16_storage is True
+            assert gpu_opt.use_fp16_packed is True
+            assert gpu_opt.use_fp16_arithmetic is True
+            assert gpu_opt.use_shader_pack8 is True
+            assert gpu_opt.use_image_storage is True
+            assert gpu_opt.use_vulkan_compute is True
 
             sample = np.zeros((320, 320, 3), dtype=np.uint8)
             dets = router.select_detector(0).detect(sample)
             assert len(dets) == 1
             assert dets[0].class_name == "person"
+            assert pixel_types_seen and all(
+                pt == FakeMat.PixelType.PIXEL_BGR2RGB for pt in pixel_types_seen
+            )
 
             bench = router.benchmark(runs=2, warmup=1, frame_bgr=sample)
             assert bench is not None
@@ -231,3 +255,60 @@ def test_cli_inspect_ncnn_command(capsys: object) -> None:
     m320 = MODELS_DIR / "picodet_m_320_quant_opt.param"
     rc = cli_main(["inspect-ncnn", "--param", str(m320)])
     assert rc == 0
+
+
+def test_cli_warn_if_gpu_falls_back_to_int8(capsys: object) -> None:
+    import pytest
+
+    from pi5_ncnn_vision.cli import _warn_if_gpu_falls_back_to_int8
+    from pi5_ncnn_vision.types import PipelineConfig
+
+    m320_int8 = MODELS_DIR / "picodet_m_320_quant_opt.param"
+    m320_fp = MODELS_DIR / "picodet_m_320_no_postprocess_opt.param"
+
+    _warn_if_gpu_falls_back_to_int8(
+        m320_int8, explicit_gpu=False, flag_label="model_param_gpu/model_bin_gpu"
+    )
+    err = capsys.readouterr().err  # type: ignore[attr-defined]
+    assert "model_param_gpu/model_bin_gpu" in err
+    assert "falling back to the INT8 CPU graph" in err
+
+    _warn_if_gpu_falls_back_to_int8(m320_fp, explicit_gpu=False)
+    assert capsys.readouterr().err == ""  # type: ignore[attr-defined]
+
+    _warn_if_gpu_falls_back_to_int8(m320_int8, explicit_gpu=True)
+    err_explicit = capsys.readouterr().err  # type: ignore[attr-defined]
+    assert "INT8-quantized graph" in err_explicit
+
+    # Half-specified GPU model pair must be rejected in both PipelineConfig and benchmark CLI
+    with pytest.raises(ValueError, match="model_param_gpu and model_bin_gpu"):
+        PipelineConfig(
+            rtsp_urls=("rtsp://192.0.2.1/s0",),
+            model_param_cpu="cpu.param",
+            model_bin_cpu="cpu.bin",
+            model_param_gpu="gpu.param",
+            model_bin_gpu=None,
+        )
+
+    cfg_empty_gpu = PipelineConfig(
+        rtsp_urls=("rtsp://192.0.2.1/s0",),
+        model_param_cpu="cpu.param",
+        model_bin_cpu="cpu.bin",
+        model_param_gpu="",
+        model_bin_gpu="",
+    )
+    assert cfg_empty_gpu.model_param_gpu is None
+    assert cfg_empty_gpu.model_bin_gpu is None
+
+    with pytest.raises(SystemExit, match="--param-gpu and --bin-gpu"):
+        cli_main(
+            [
+                "benchmark",
+                "--param-cpu",
+                str(m320_int8),
+                "--bin-cpu",
+                "cpu.bin",
+                "--param-gpu",
+                str(m320_fp),
+            ]
+        )

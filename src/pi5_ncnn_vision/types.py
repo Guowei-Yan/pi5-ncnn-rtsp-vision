@@ -13,7 +13,7 @@ DEFAULT_FFMPEG_CAPTURE_OPTIONS = (
     "fflags;nobuffer|"
     "probesize;32|"
     "analyzeduration;0|"
-    "stimeout;5000000"
+    "timeout;5000000"
 )
 
 DEFAULT_ALLOWED_SPEEDS: frozenset[int] = frozenset(
@@ -74,6 +74,7 @@ class FramePacket:
     frame_count: int
     capture_timestamp: float
     frame_bgr: np.ndarray
+    capture_monotonic: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +206,15 @@ class PipelineConfig:
             raise ValueError("At least one RTSP URL must be configured in rtsp_urls.")
         if not self.model_param_cpu or not self.model_bin_cpu:
             raise ValueError("model_param_cpu and model_bin_cpu are required.")
+        # Normalize empty strings to None so direct Python callers behave identically to YAML parsing.
+        if self.model_param_gpu == "":
+            object.__setattr__(self, "model_param_gpu", None)
+        if self.model_bin_gpu == "":
+            object.__setattr__(self, "model_bin_gpu", None)
+        if (self.model_param_gpu is None) != (self.model_bin_gpu is None):
+            raise ValueError(
+                "model_param_gpu and model_bin_gpu must either both be set or both be omitted."
+            )
         if self.target_fps_per_stream <= 0:
             raise ValueError("target_fps_per_stream must be > 0.")
         if self.ncnn_num_threads < 1:
@@ -262,8 +272,16 @@ class PipelineConfig:
             rtsp_urls=urls,
             model_param_cpu=model_param_cpu,
             model_bin_cpu=model_bin_cpu,
-            model_param_gpu=str(data.get("model_param_gpu") or model_param_cpu),
-            model_bin_gpu=str(data.get("model_bin_gpu") or model_bin_cpu),
+            model_param_gpu=(
+                str(data["model_param_gpu"])
+                if data.get("model_param_gpu")
+                else None
+            ),
+            model_bin_gpu=(
+                str(data["model_bin_gpu"])
+                if data.get("model_bin_gpu")
+                else None
+            ),
             decoder=decoder,
             target_fps_per_stream=float(data.get("target_fps_per_stream", 2.0)),
             cap_buffersize=int(data.get("cap_buffersize", 1)),
